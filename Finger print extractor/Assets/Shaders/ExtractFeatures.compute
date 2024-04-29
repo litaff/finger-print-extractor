@@ -1,0 +1,188 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ConvertScaleAbs
+#pragma kernel GrayScaleHist
+#pragma kernel EqualizeHist
+#pragma kernel ApplyEqualizedHist
+#pragma kernel ComputeGaussianKernel
+#pragma kernel GaussianAdaptiveThreshold
+#pragma kernel GaussianBlur
+#pragma kernel ComputeGaborKernel
+
+RWTexture2D<float4> result;
+
+float4 convert_scale_abs(float4 input, float alpha, float beta)
+{
+    return float4(
+        abs(input.r * alpha + beta / 255),
+        abs(input.g * alpha + beta / 255),
+        abs(input.b * alpha + beta / 255),
+        0.0);
+}
+
+float3 ToGrayScale(float3 input)
+{
+    return float3(
+        0.299 * input.r + 0.587 * input.g + 0.114 * input.b,
+        0.299 * input.r + 0.587 * input.g + 0.114 * input.b,
+        0.299 * input.r + 0.587 * input.g + 0.114 * input.b);
+}
+
+float alpha;
+float beta;
+RWStructuredBuffer<uint> histogram;
+RWStructuredBuffer<float> cdf;
+
+[numthreads(8,8,1)]
+void ConvertScaleAbs(uint3 id : SV_DispatchThreadID)
+{
+    result[id.xy] = convert_scale_abs(result[id.xy], alpha, beta);
+}
+
+[numthreads(8,8,1)]
+void GrayScaleHist(uint3 id : SV_DispatchThreadID)
+{
+    result[id.xy] = float4(ToGrayScale(result[id.xy].rgb), 0.0);
+    InterlockedAdd(histogram[int(result[id.xy].r * 255)], 1);
+}
+
+int width;
+int height;
+
+[numthreads(1,1,1)]
+void EqualizeHist(uint3 id : SV_DispatchThreadID)
+{
+    uint smoothed[256];
+    smoothed[0] = histogram[0];
+    for (uint a = 1; a < 256; a++)
+    {
+        uint value = smoothed[a - 1] + histogram[a];
+        smoothed[a] = value;
+    }
+
+    // Normalize the CDF
+    uint smoothedMin = 0;
+    for (uint b = 0; b < 256; b++)
+    {
+        if (smoothed[b] == 0) continue;
+        smoothedMin = smoothed[b];
+        break;
+    }
+
+    bool passed = false;
+    for (uint c = 0; c < 256; c++)
+    {
+        if (smoothed[c] == 0 && !passed)
+        {
+            continue;
+        }
+
+        passed = true;
+        cdf[c] = float(smoothed[c] - smoothedMin) / float(width * height - smoothedMin);
+    }
+}
+
+[numthreads(8,8,1)]
+void ApplyEqualizedHist(uint3 id : SV_DispatchThreadID)
+{
+    float gray = cdf[int(result[id.xy].r * 255)];
+    result[id.xy] = float4(gray, gray, gray, 0.0);
+}
+
+RWStructuredBuffer<float> kernel; // ksize * ksize
+uint ksize;
+float sigma;
+int border;
+
+[numthreads(1,1,1)]
+void ComputeGaussianKernel(uint3 id : SV_DispatchThreadID)
+{
+    const float pi = 3.14159265358979323846;
+
+    int i = int(id.x) - border;
+    int j = int(id.y) - border;
+
+    int index = (i + border) * ksize + (j + border);
+    kernel[index] = 1.0 / (2.0 * pi * sigma * sigma) * exp(-(i * i + j * j) / (2 * sigma * sigma));
+}
+
+RWTexture2D<float4> input;
+int c;
+
+[numthreads(32,32,1)]
+void GaussianAdaptiveThreshold(uint3 id : SV_DispatchThreadID)
+{
+    float sum = 0.0;
+    float weight_sum = 0.0;
+
+    for (int i = -border; i <= border; i++)
+    {
+        for (int j = -border; j <= border; j++)
+        {
+            int2 index = int2(int(id.x) + i, int(id.y) + j);
+            if (index.x < 0 || index.x >= width || index.y < 0 || index.y >= height) continue;
+
+            int weightIndex = (i + border) * ksize + (j + border);
+            sum += kernel[weightIndex] * input[index].r;
+            weight_sum += kernel[weightIndex];
+        }
+    }
+
+    float gaussian_weighted = sum / weight_sum;
+
+    if (input[id.xy].r > gaussian_weighted - c / 255.0)
+        result[id.xy] = float4(1.0, 1.0, 1.0, 0.0);
+    else
+        result[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+}
+
+[numthreads(32,32,1)]
+void GaussianBlur(uint3 id : SV_DispatchThreadID)
+{
+    float sum = 0.0;
+    float weight_sum = 0.0;
+
+    for (int i = -border; i <= border; i++)
+    {
+        for (int j = -border; j <= border; j++)
+        {
+            int2 index = int2(int(id.x) + i, int(id.y) + j);
+            if (index.x < 0 || index.x >= width || index.y < 0 || index.y >= height) continue;
+
+            int weightIndex = (i + border) * ksize + (j + border);
+            sum += kernel[weightIndex] * input[index].r;
+            weight_sum += kernel[weightIndex];
+        }
+    }
+
+    float gaussian_weighted = sum / weight_sum;
+    result[id.xy] = float4(gaussian_weighted, gaussian_weighted, gaussian_weighted, 0.0);
+}
+
+RWTexture2D<float4> gaborKernel; // gaborSize * gaborSize
+float theta;
+float lambda;
+float gamma;
+float psi;
+
+[numthreads(1,1,1)]
+void ComputeGaborKernel(uint3 id : SV_DispatchThreadID)
+{
+    int width, height;
+    gaborKernel.GetDimensions(width, height);
+    float total = width * height;
+
+    // Convert thread ID to UV coordinates
+    float2 uv = id.xy / float2(width, height);
+
+    // Center
+    uv -= width / 2;
+
+    float2 rotatedUV;
+    rotatedUV.x = uv.x * cos(theta) + uv.y * sin(theta);
+    rotatedUV.y = -uv.x * sin(theta) + uv.y * cos(theta);
+
+    float value = exp(-(rotatedUV.x * rotatedUV.x + gamma * rotatedUV.y * rotatedUV.y) / (2 * sigma * sigma))
+        * cos(6.28 * rotatedUV.x / lambda + psi);
+
+    gaborKernel[id.xy] = float4(value, value, value, 0.0);
+}
